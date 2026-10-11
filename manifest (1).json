@@ -1,0 +1,2 @@
+{ "name": "ミカン カウンター", "short_name": "ミカン", "start_url": "./", "display": "standalone",
+  "background_color": "#f6f3ea", "theme_color": "#1f5a34", "icons": [] }
