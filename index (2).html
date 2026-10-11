@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="manifest" href="./manifest.json">
+<meta name="theme-color" content="#1f5a34">
+<title>ミカン カウンター</title>
+<style>
+  :root { --bg:#f6f3ea; --ink:#1d2b1f; --leaf:#1f5a34; --mikan:#f08a12; --line:#cfc8b4; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:system-ui,"Hiragino Sans","Noto Sans JP",sans-serif; }
+  main { max-width:640px; margin:0 auto; padding:env(safe-area-inset-top) 12px 24px; }
+  h1 { font-size:1.1rem; margin:12px 0 8px; }
+  #view { position:relative; background:#000; border-radius:10px; overflow:hidden; min-height:120px; }
+  canvas { width:100%; display:block; }
+  #hud { position:absolute; left:8px; top:8px; background:rgba(0,0,0,.62); color:#fff; padding:4px 12px 6px; border-radius:8px; }
+  #big { font-size:2.4rem; font-weight:700; line-height:1.1; }
+  #hud small { display:block; font-size:.75rem; line-height:1.4; }
+  #status { font-size:.85rem; margin:8px 0; min-height:1.2em; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; align-items:center; }
+  button, select { font:inherit; padding:10px 14px; border-radius:8px; border:2px solid var(--leaf); background:#fff; color:var(--leaf); font-weight:600; }
+  button.main { background:var(--mikan); border-color:var(--mikan); color:#fff; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:3px solid var(--mikan); outline-offset:2px; }
+  input[type=text] { font:inherit; padding:8px; border:2px solid var(--line); border-radius:8px; width:8em; }
+  label { font-size:.85rem; }
+  .tw { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-size:.78rem; margin-top:8px; white-space:nowrap; }
+  th, td { border-bottom:1px solid var(--line); padding:4px 6px; text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+</style>
+</head>
+<body>
+<main>
+  <h1>ミカン カウンター(摘果前・端末内処理)</h1>
+  <div id="view">
+    <canvas id="cv" width="640" height="360"></canvas>
+    <div id="hud">
+      <div id="big">0</div>
+      <small id="modeLabel">いま映っている数</small>
+      <small id="info">FPS - / - × -</small>
+      <small id="mk">marker 0</small>
+    </div>
+  </div>
+  <div id="status">モデルを読み込み中…</div>
+
+  <div class="row">
+    <button id="start" class="main">カメラ開始</button>
+    <button id="reset">累計リセット</button>
+    <button id="mode">表示切替:フレーム/累計</button>
+  </div>
+  <div class="row">
+    <label>解像度
+      <select id="res">
+        <option value="640x480">640×480</option>
+        <option value="1280x720" selected>1280×720</option>
+        <option value="1920x1080">1920×1080</option>
+      </select>
+    </label>
+    <label>信頼度 <input type="range" id="conf" min="0.1" max="0.9" step="0.05" value="0.35"> <span id="confv">0.35</span></label>
+  </div>
+  <div class="row">
+    <label>木のID <input type="text" id="tree" value="T01"></label>
+    <button id="rec" class="main">この木を記録</button>
+    <button id="csv">CSV保存</button>
+    <button id="clr">記録を消す</button>
+  </div>
+  <div class="tw"><table id="tbl"><thead><tr>
+    <th>時刻</th><th>木</th><th>最大</th><th>累計</th><th>marker</th><th>FPS</th><th>解像度</th><th>秒</th>
+  </tr></thead><tbody></tbody></table></div>
+</main>
+
+<script src="./lib/ort.min.js"></script>
+<script>
+"use strict";
+const MODEL_URL = "./model/best_quantized.onnx";
+const SIZE = 640, IOU_NMS = 0.5;
+const CLS_MARKER = 0, CLS_MIKAN = 1;   // names: {0:'marker', 1:'mikan'}
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+const video = document.createElement("video");
+video.playsInline = true; video.muted = true;
+const pre = document.createElement("canvas"); pre.width = pre.height = SIZE;
+const pctx = pre.getContext("2d", { willReadFrequently: true });
+const buf = new Float32Array(3 * SIZE * SIZE);
+
+let session = null, running = false, showTotal = false, stream = null;
+let mikanNow = 0, mikanMax = 0, markerNow = 0, markerMax = 0, totalCount = 0;
+let tracks = [], nextId = 1, shift = { x: 0, y: 0 };
+let records = [];
+let sessFrames = 0, sessStart = performance.now();   // 記録用の平均FPS
+let fpsFrames = 0, fpsStart = performance.now(), fpsNow = 0; // 表示用FPS
+
+async function loadModel() {
+  try {
+    ort.env.wasm.wasmPaths = "./lib/";
+    ort.env.wasm.numThreads = 1;
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
+    $("status").textContent = "準備OK。「カメラ開始」を押してください。";
+  } catch (e) { $("status").textContent = "モデル読み込み失敗: " + e.message; }
+}
+
+function preprocess() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.min(SIZE / vw, SIZE / vh), w = vw * scale, h = vh * scale;
+  const px = (SIZE - w) / 2, py = (SIZE - h) / 2;
+  pctx.fillStyle = "#727272"; pctx.fillRect(0, 0, SIZE, SIZE);
+  pctx.drawImage(video, px, py, w, h);
+  const d = pctx.getImageData(0, 0, SIZE, SIZE).data, n = SIZE * SIZE;
+  for (let i = 0; i < n; i++) {
+    buf[i] = d[i * 4] / 255; buf[n + i] = d[i * 4 + 1] / 255; buf[2 * n + i] = d[i * 4 + 2] / 255;
+  }
+  return { tensor: new ort.Tensor("float32", buf, [1, 3, SIZE, SIZE]), scale, px, py };
+}
+
+// 出力 [1, 6, 8400] = 4(cx,cy,w,h) + 2クラス
+function decode(out, scale, px, py, conf) {
+  const N = out.dims[2], d = out.data, nc = out.dims[1] - 4, boxes = [];
+  for (let i = 0; i < N; i++) {
+    let c = 0, s = d[4 * N + i];
+    for (let k = 1; k < nc; k++) { const v = d[(4 + k) * N + i]; if (v > s) { s = v; c = k; } }
+    if (s < conf) continue;
+    const cx = (d[i] - px) / scale, cy = (d[N + i] - py) / scale;
+    const w = d[2 * N + i] / scale, h = d[3 * N + i] / scale;
+    boxes.push({ c, s, cx, cy, w, h, x1: cx - w / 2, y1: cy - h / 2, x2: cx + w / 2, y2: cy + h / 2 });
+  }
+  return nms(boxes);
+}
+function iou(a, b) {
+  const iw = Math.max(0, Math.min(a.x2, b.x2) - Math.max(a.x1, b.x1));
+  const ih = Math.max(0, Math.min(a.y2, b.y2) - Math.max(a.y1, b.y1));
+  const inter = iw * ih;
+  return inter / (a.w * a.h + b.w * b.h - inter + 1e-9);
+}
+function nms(boxes) {
+  boxes.sort((a, b) => b.s - a.s);
+  const keep = [];
+  for (const b of boxes) if (keep.every(k => k.c !== b.c || iou(k, b) < IOU_NMS)) keep.push(b);
+  return keep;
+}
+
+// 簡易トラッカー(mikanのみ)。カメラの平均移動量で位置を予測して同一判定
+function track(dets) {
+  const used = new Set(), moves = [];
+  for (const t of tracks) {
+    const px = t.x + shift.x, py = t.y + shift.y;
+    let bi = -1, bd = Infinity;
+    dets.forEach((d, i) => {
+      if (used.has(i)) return;
+      const dist = Math.hypot(d.cx - px, d.cy - py);
+      if (dist < bd && dist < Math.max(d.w, d.h) * 0.8) { bd = dist; bi = i; }
+    });
+    if (bi >= 0) {
+      used.add(bi); moves.push([dets[bi].cx - t.x, dets[bi].cy - t.y]);
+      t.x = dets[bi].cx; t.y = dets[bi].cy; t.hits++; t.miss = 0;
+      if (!t.counted && t.hits >= 3) { t.counted = true; totalCount++; }
+    } else { t.miss++; t.x = px; t.y = py; }
+  }
+  if (moves.length >= 2) {
+    const med = a => a.sort((p, q) => p - q)[a.length >> 1];
+    shift = { x: 0.6 * shift.x + 0.4 * med(moves.map(m => m[0])), y: 0.6 * shift.y + 0.4 * med(moves.map(m => m[1])) };
+  } else { shift = { x: shift.x * 0.8, y: shift.y * 0.8 }; }
+  dets.forEach((d, i) => { if (!used.has(i)) tracks.push({ id: nextId++, x: d.cx, y: d.cy, hits: 1, miss: 0, counted: false }); });
+  tracks = tracks.filter(t => t.miss < 15);
+}
+
+function resText() { return video.videoWidth + "×" + video.videoHeight; }
+
+async function loop() {
+  if (!running) return;
+  try {
+    const { tensor, scale, px, py } = preprocess();
+    const res = await session.run({ [session.inputNames[0]]: tensor });
+    const dets = decode(res[session.outputNames[0]], scale, px, py, parseFloat($("conf").value));
+    const mk = dets.filter(d => d.c === CLS_MIKAN), mr = dets.filter(d => d.c === CLS_MARKER);
+    track(mk);
+    mikanNow = mk.length; mikanMax = Math.max(mikanMax, mikanNow);
+    markerNow = mr.length; markerMax = Math.max(markerMax, markerNow);
+
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0);
+    ctx.lineWidth = Math.max(2, cv.width / 300);
+    for (const b of dets) {
+      ctx.strokeStyle = b.c === CLS_MIKAN ? "#f08a12" : "#2aa3ff";
+      ctx.strokeRect(b.x1, b.y1, b.w, b.h);
+    }
+
+    sessFrames++; fpsFrames++;
+    const now = performance.now();
+    if (now - fpsStart >= 1000) { fpsNow = fpsFrames * 1000 / (now - fpsStart); fpsFrames = 0; fpsStart = now; }
+    $("big").textContent = showTotal ? totalCount : mikanNow;
+    $("info").textContent = `FPS ${fpsNow.toFixed(1)} / ${resText()}`;
+    $("mk").textContent = `marker ${markerNow}`;
+  } catch (e) { $("status").textContent = "推論エラー: " + e.message; running = false; return; }
+  requestAnimationFrame(loop);
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const [w, h] = $("res").value.split("x").map(Number);
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: w }, height: { ideal: h } }, audio: false });
+  video.srcObject = stream; await video.play();
+  const st = stream.getVideoTracks()[0].getSettings();
+  $("status").textContent = `カメラ実解像度 ${resText()} / カメラfps設定 ${st.frameRate ? Math.round(st.frameRate) : "不明"}`;
+}
+
+$("start").onclick = async () => {
+  if (!session) return;
+  if (running) { running = false; $("start").textContent = "カメラ開始"; return; }
+  try {
+    await startCamera();
+    running = true; sessFrames = 0; sessStart = performance.now();
+    $("start").textContent = "停止"; loop();
+  } catch (e) { $("status").textContent = "カメラ使用不可(HTTPS・許可設定を確認): " + e.message; }
+};
+$("res").onchange = async () => { if (running) { try { await startCamera(); } catch (e) { $("status").textContent = e.message; } } };
+function resetAll() {
+  totalCount = 0; mikanMax = 0; markerMax = 0; tracks = []; shift = { x: 0, y: 0 };
+  sessFrames = 0; sessStart = performance.now();
+}
+$("reset").onclick = resetAll;
+$("mode").onclick = () => { showTotal = !showTotal; $("modeLabel").textContent = showTotal ? "累計(トラッキング)" : "いま映っている数"; };
+$("conf").oninput = e => { $("confv").textContent = e.target.value; };
+
+$("rec").onclick = () => {
+  const sec = (performance.now() - sessStart) / 1000;
+  const r = {
+    time: new Date().toISOString(), tree: $("tree").value, max: mikanMax, total: totalCount,
+    marker: markerMax, fps: sec > 0 ? sessFrames / sec : 0, res: video.videoWidth ? resText() : "-",
+    sec, conf: $("conf").value };
+  records.push(r);
+  const tr = document.createElement("tr");
+  [r.time.slice(11, 19), r.tree, r.max, r.total, r.marker, r.fps.toFixed(1), r.res, r.sec.toFixed(0)]
+    .forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); });
+  $("tbl").tBodies[0].appendChild(tr);
+  resetAll();
+};
+$("csv").onclick = () => {
+  const head = "time,tree_id,mikan_max_in_frame,mikan_tracked_total,marker_max,avg_fps,resolution,duration_s,conf_threshold\n";
+  const q = s => '"' + String(s).replace(/"/g, '""') + '"';
+  const body = records.map(r => [r.time, q(r.tree), r.max, r.total, r.marker, r.fps.toFixed(2), r.res, r.sec.toFixed(1), r.conf].join(",")).join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + head + body], { type: "text/csv" }));
+  a.download = "mikan_count.csv"; a.click();
+};
+$("clr").onclick = () => { records = []; $("tbl").tBodies[0].innerHTML = ""; };
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js");
+loadModel();
+</script>
+</body>
+</html>
