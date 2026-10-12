@@ -1,7 +1,7 @@
 // モデルやコードを変えたらCACHEの数字を上げる
-const CACHE = "mikan-v5";
+const CACHE = "mikan-v6";
 const FILES = ["./", "./index.html", "./manifest.json",
-  "./model/best_quantized.onnx",
+  "./model/best.onnx",
   "./lib/ort.wasm.min.js", "./lib/ort-wasm-simd-threaded.wasm", "./lib/ort-wasm-simd-threaded.mjs"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => Promise.allSettled(FILES.map(f => c.add(f)))));
