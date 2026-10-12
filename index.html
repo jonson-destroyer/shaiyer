@@ -43,11 +43,13 @@
     </div>
   </div>
   <div id="status">モデルを読み込み中…</div>
+  <div id="diag" style="font-size:.75rem;color:#555;word-break:break-all"></div>
 
   <div class="row">
     <button id="start" class="main">カメラ開始</button>
     <button id="reset">累計リセット</button>
     <button id="mode">表示切替:フレーム/累計</button>
+    <button id="retry">スレッド再試行</button>
   </div>
   <div class="row">
     <label>解像度
@@ -103,8 +105,10 @@ async function loadModel() {
     ort.env.wasm.numThreads = threads;
     session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
     $("status").textContent = `準備OK(スレッド数 ${threads})。「カメラ開始」を押してください。`;
+    const sw = navigator.serviceWorker && navigator.serviceWorker.controller ? "有" : "無";
+    $("diag").textContent = `診断: isolated=${crossOriginIsolated} / SW制御=${sw} / nothreads=${sessionStorage.getItem("nothreads") || "-"} / 失敗理由=${sessionStorage.getItem("threadErr") || "-"}`;
   } catch (e) {
-    if (threads > 1) { sessionStorage.setItem("nothreads", "1"); location.reload(); return; }
+    if (threads > 1) { sessionStorage.setItem("threadErr", String(e.message).slice(0, 200)); sessionStorage.setItem("nothreads", "1"); location.reload(); return; }
     let diag = "";
     for (const f of ["./lib/ort.wasm.min.js", "./lib/ort-wasm-simd-threaded.mjs", "./lib/ort-wasm-simd-threaded.wasm", MODEL_URL]) {
       try { const r = await fetch(f, { cache: "no-store" }); diag += `\n${f.split("/").pop()}: ${r.status}`; }
@@ -236,6 +240,7 @@ function resetAll() {
 }
 $("reset").onclick = resetAll;
 $("mode").onclick = () => { showTotal = !showTotal; $("modeLabel").textContent = showTotal ? "累計(トラッキング)" : "いま映っている数"; };
+$("retry").onclick = () => { ["nothreads","coi","threadErr"].forEach(k => sessionStorage.removeItem(k)); location.reload(); };
 $("conf").oninput = e => { $("confv").textContent = e.target.value; };
 
 $("rec").onclick = () => {
