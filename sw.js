@@ -1,8 +1,8 @@
 // 初回オンライン時にキャッシュ。以降はオフラインで動作。モデルやコードを変えたらCACHEの数字を上げる
-const CACHE = "mikan-v2";
+const CACHE = "mikan-v3";
 const FILES = ["./", "./index.html", "./manifest.json",
   "./model/best_quantized.onnx",
-  "./lib/ort.min.js", "./lib/ort-wasm-simd-threaded.wasm", "./lib/ort-wasm-simd-threaded.mjs"];
+ "./lib/ort.wasm.min.js", "./lib/ort-wasm-simd-threaded.wasm", "./lib/ort-wasm-simd-threaded.mjs"];
 self.addEventListener("install", e => {
   e.waitUntil(caches.open(CACHE).then(c => Promise.allSettled(FILES.map(f => c.add(f)))));
   self.skipWaiting();
