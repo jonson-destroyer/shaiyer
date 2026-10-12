@@ -70,7 +70,7 @@
   </tr></thead><tbody></tbody></table></div>
 </main>
 
-<script src="./lib/ort.wasm.min.js"></script>
+<script src="./lib/ort.min.js"></script>
 <script>
 "use strict";
 const MODEL_URL = "./model/best_quantized.onnx";
@@ -93,12 +93,23 @@ let sessFrames = 0, sessStart = performance.now();   // 記録用の平均FPS
 let fpsFrames = 0, fpsStart = performance.now(), fpsNow = 0; // 表示用FPS
 
 async function loadModel() {
+  const abs = f => new URL(f, location.href).href;
   try {
-    ort.env.wasm.wasmPaths = "./lib/";
+    ort.env.wasm.wasmPaths = {
+      mjs: abs("./lib/ort-wasm-simd-threaded.mjs"),
+      wasm: abs("./lib/ort-wasm-simd-threaded.wasm") };
     ort.env.wasm.numThreads = 1;
     session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
     $("status").textContent = "準備OK。「カメラ開始」を押してください。";
-  } catch (e) { $("status").textContent = "モデル読み込み失敗: " + e.message; }
+  } catch (e) {
+    let diag = "";
+    for (const f of ["./lib/ort.wasm.min.js", "./lib/ort-wasm-simd-threaded.mjs", "./lib/ort-wasm-simd-threaded.wasm", MODEL_URL]) {
+      try { const r = await fetch(f, { cache: "no-store" }); diag += `\n${f.split("/").pop()}: ${r.status}`; }
+      catch (e2) { diag += `\n${f.split("/").pop()}: 取得失敗`; }
+    }
+    $("status").style.whiteSpace = "pre-wrap";
+    $("status").textContent = "モデル読み込み失敗: " + e.message + "\n【ファイル確認】" + diag;
+  }
 }
 
 function preprocess() {
@@ -169,6 +180,7 @@ function resText() { return video.videoWidth + "×" + video.videoHeight; }
 
 async function loop() {
   if (!running) return;
+  if (!session) { try { cv.width = video.videoWidth; cv.height = video.videoHeight; ctx.drawImage(video, 0, 0); } catch (e) {} requestAnimationFrame(loop); return; }
   try {
     const { tensor, scale, px, py } = preprocess();
     const res = await session.run({ [session.inputNames[0]]: tensor });
@@ -207,7 +219,6 @@ async function startCamera() {
 }
 
 $("start").onclick = async () => {
-  if (!session) return;
   if (running) { running = false; $("start").textContent = "カメラ開始"; return; }
   try {
     await startCamera();
