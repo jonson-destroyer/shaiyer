@@ -85,7 +85,7 @@ const pre = document.createElement("canvas"); pre.width = pre.height = SIZE;
 const pctx = pre.getContext("2d", { willReadFrequently: true });
 const buf = new Float32Array(3 * SIZE * SIZE);
 
-let session = null, running = false, showTotal = false, stream = null;
+let threads = 1, session = null, running = false, showTotal = false, stream = null;
 let mikanNow = 0, mikanMax = 0, markerNow = 0, markerMax = 0, totalCount = 0;
 let tracks = [], nextId = 1, shift = { x: 0, y: 0 };
 let records = [];
@@ -98,10 +98,13 @@ async function loadModel() {
     ort.env.wasm.wasmPaths = {
       mjs: abs("./lib/ort-wasm-simd-threaded.mjs"),
       wasm: abs("./lib/ort-wasm-simd-threaded.wasm") };
-    ort.env.wasm.numThreads = 1;
+    threads = (crossOriginIsolated && !sessionStorage.getItem("nothreads"))
+      ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+    ort.env.wasm.numThreads = threads;
     session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["wasm"] });
-    $("status").textContent = "準備OK。「カメラ開始」を押してください。";
+    $("status").textContent = `準備OK(スレッド数 ${threads})。「カメラ開始」を押してください。`;
   } catch (e) {
+    if (threads > 1) { sessionStorage.setItem("nothreads", "1"); location.reload(); return; }
     let diag = "";
     for (const f of ["./lib/ort.wasm.min.js", "./lib/ort-wasm-simd-threaded.mjs", "./lib/ort-wasm-simd-threaded.wasm", MODEL_URL]) {
       try { const r = await fetch(f, { cache: "no-store" }); diag += `\n${f.split("/").pop()}: ${r.status}`; }
@@ -202,7 +205,7 @@ async function loop() {
     const now = performance.now();
     if (now - fpsStart >= 1000) { fpsNow = fpsFrames * 1000 / (now - fpsStart); fpsFrames = 0; fpsStart = now; }
     $("big").textContent = showTotal ? totalCount : mikanNow;
-    $("info").textContent = `FPS ${fpsNow.toFixed(1)} / ${resText()}`;
+    $("info").textContent = `FPS ${fpsNow.toFixed(1)} / ${resText()} / ${threads}th`;
     $("mk").textContent = `marker ${markerNow}`;
   } catch (e) { $("status").textContent = "推論エラー: " + e.message; running = false; return; }
   requestAnimationFrame(loop);
@@ -258,8 +261,16 @@ $("csv").onclick = () => {
 };
 $("clr").onclick = () => { records = []; $("tbl").tBodies[0].innerHTML = ""; };
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js");
-loadModel();
+(async function boot() {
+  if ("serviceWorker" in navigator) {
+    try { await navigator.serviceWorker.register("./sw.js"); } catch (e) {}
+    if (!crossOriginIsolated && !sessionStorage.getItem("coi")) {
+      sessionStorage.setItem("coi", "1");
+      await navigator.serviceWorker.ready; location.reload(); return;
+    }
+  }
+  loadModel();
+})();
 </script>
 </body>
 </html>
