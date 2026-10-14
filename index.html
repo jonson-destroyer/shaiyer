@@ -52,6 +52,10 @@
     <button id="retry">スレッド再試行</button>
   </div>
   <div class="row">
+    <input type="file" id="photo" accept="image/*" multiple hidden>
+    <button id="photoBtn" class="main">写真から数える(複数選択可)</button>
+  </div>
+  <div class="row">
     <label>解像度
       <select id="res">
         <option value="640x480">640×480</option>
@@ -87,6 +91,7 @@ const pre = document.createElement("canvas"); pre.width = pre.height = SIZE;
 const pctx = pre.getContext("2d", { willReadFrequently: true });
 const buf = new Float32Array(3 * SIZE * SIZE);
 
+let photoState = null, photoQueue = [], photoUrl = null, inferBusy = false;
 let threads = 1, session = null, running = false, showTotal = false, stream = null;
 let mikanNow = 0, mikanMax = 0, markerNow = 0, markerMax = 0, totalCount = 0;
 let tracks = [], nextId = 1, shift = { x: 0, y: 0 };
@@ -119,12 +124,11 @@ async function loadModel() {
   }
 }
 
-function preprocess() {
-  const vw = video.videoWidth, vh = video.videoHeight;
+function preprocess(src = video, vw = video.videoWidth, vh = video.videoHeight) {
   const scale = Math.min(SIZE / vw, SIZE / vh), w = vw * scale, h = vh * scale;
   const px = (SIZE - w) / 2, py = (SIZE - h) / 2;
   pctx.fillStyle = "#727272"; pctx.fillRect(0, 0, SIZE, SIZE);
-  pctx.drawImage(video, px, py, w, h);
+  pctx.drawImage(src, px, py, w, h);
   const d = pctx.getImageData(0, 0, SIZE, SIZE).data, n = SIZE * SIZE;
   for (let i = 0; i < n; i++) {
     buf[i] = d[i * 4] / 255; buf[n + i] = d[i * 4 + 1] / 255; buf[2 * n + i] = d[i * 4 + 2] / 255;
@@ -190,7 +194,8 @@ async function loop() {
   if (!session) { try { cv.width = video.videoWidth; cv.height = video.videoHeight; ctx.drawImage(video, 0, 0); } catch (e) {} requestAnimationFrame(loop); return; }
   try {
     const { tensor, scale, px, py } = preprocess();
-    const res = await session.run({ [session.inputNames[0]]: tensor });
+    inferBusy = true;
+    let res; try { res = await session.run({ [session.inputNames[0]]: tensor }); } finally { inferBusy = false; }
     const dets = decode(res[session.outputNames[0]], scale, px, py, parseFloat($("conf").value));
     const mk = dets.filter(d => d.c === CLS_MIKAN), mr = dets.filter(d => d.c === CLS_MARKER);
     track(mk);
@@ -230,6 +235,8 @@ async function startCamera() {
 $("start").onclick = async () => {
   if (running) { running = false; $("start").textContent = "カメラ開始"; return; }
   try {
+    photoState = null; photoQueue = [];
+    $("modeLabel").textContent = showTotal ? "累計(トラッキング)" : "いま映っている数";
     await startCamera();
     running = true; sessFrames = 0; sessStart = performance.now();
     $("start").textContent = "停止"; loop();
@@ -243,25 +250,78 @@ function resetAll() {
 $("reset").onclick = resetAll;
 $("mode").onclick = () => { showTotal = !showTotal; $("modeLabel").textContent = showTotal ? "累計(トラッキング)" : "いま映っている数"; };
 $("retry").onclick = () => { ["nothreads","coi","threadErr"].forEach(k => sessionStorage.removeItem(k)); location.reload(); };
-$("conf").oninput = e => { $("confv").textContent = e.target.value; };
+$("conf").oninput = e => { $("confv").textContent = e.target.value; if (photoState) showPhoto(); };
 
-$("rec").onclick = () => {
-  const sec = (performance.now() - sessStart) / 1000;
-  const r = {
-    time: new Date().toISOString(), tree: $("tree").value, max: mikanMax, total: totalCount,
-    marker: markerMax, fps: sec > 0 ? sessFrames / sec : 0, res: video.videoWidth ? resText() : "-",
-    sec, conf: $("conf").value };
+function addRecord(r) {
+  r.time = new Date().toISOString(); r.conf = $("conf").value;
   records.push(r);
   const tr = document.createElement("tr");
-  [r.time.slice(11, 19), r.tree, r.max, r.total, r.marker, r.fps.toFixed(1), r.res, r.sec.toFixed(0)]
+  [r.time.slice(11, 19), r.tree, r.max, r.total, r.marker, r.fps.toFixed(1), r.res, r.sec.toFixed(r.src === "photo" ? 2 : 0)]
     .forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); });
   $("tbl").tBodies[0].appendChild(tr);
+}
+$("rec").onclick = () => {
+  if (photoState) {   // 写真モード: 今の信頼度での検出数を記録して次の写真へ
+    const p = photoState;
+    addRecord({ tree: $("tree").value, max: p.mk, total: p.mk, marker: p.mr, fps: 1 / p.sec,
+      res: `${p.img.naturalWidth}×${p.img.naturalHeight}`, sec: p.sec, src: "photo" });
+    nextPhoto(); return;
+  }
+  const sec = (performance.now() - sessStart) / 1000;
+  addRecord({ tree: $("tree").value, max: mikanMax, total: totalCount, marker: markerMax,
+    fps: sec > 0 ? sessFrames / sec : 0, res: video.videoWidth ? resText() : "-", sec, src: "camera" });
   resetAll();
 };
+
+// ===== 写真モード =====
+function showPhoto() {
+  const p = photoState, w = p.img.naturalWidth, h = p.img.naturalHeight;
+  const dets = decode(p.out, p.scale, p.px, p.py, parseFloat($("conf").value));
+  const mk = dets.filter(d => d.c === CLS_MIKAN), mr = dets.filter(d => d.c === CLS_MARKER);
+  const k = Math.min(1, 1600 / Math.max(w, h));
+  cv.width = Math.round(w * k); cv.height = Math.round(h * k);
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.drawImage(p.img, 0, 0, w, h);
+  ctx.lineWidth = Math.max(2, w / 300);
+  const fs = Math.max(14, w / 40); ctx.font = `${fs}px sans-serif`;
+  for (const b of dets) {
+    ctx.strokeStyle = b.c === CLS_MIKAN ? "#f08a12" : "#2aa3ff";
+    ctx.strokeRect(b.x1, b.y1, b.w, b.h);
+    ctx.fillStyle = "#fff"; ctx.fillText(b.s.toFixed(2), b.x1 + 3, b.y1 + fs);
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  p.mk = mk.length; p.mr = mr.length;
+  $("big").textContent = p.mk; $("modeLabel").textContent = "写真の検出数";
+  $("info").textContent = `写真 ${w}×${h} / ${(p.sec * 1000).toFixed(0)}ms`;
+  $("mk").textContent = `marker ${p.mr}`;
+}
+async function nextPhoto() {
+  if (!photoQueue.length) { photoState = null; $("status").textContent = "写真は以上です。"; return; }
+  if (!session) { $("status").textContent = "モデルが未読込です。"; return; }
+  const f = photoQueue.shift();
+  try {
+    running = false; $("start").textContent = "カメラ開始";
+    while (inferBusy) await new Promise(r => setTimeout(r, 50));
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (photoUrl) URL.revokeObjectURL(photoUrl);
+    photoUrl = URL.createObjectURL(f);
+    const img = new Image(); img.src = photoUrl; await img.decode();   // EXIFの向きは自動で反映される
+    const t0 = performance.now();
+    const { tensor, scale, px, py } = preprocess(img, img.naturalWidth, img.naturalHeight);
+    const res = await session.run({ [session.inputNames[0]]: tensor });
+    photoState = { img, out: res[session.outputNames[0]], scale, px, py, name: f.name, sec: (performance.now() - t0) / 1000 };
+    $("tree").value = f.name.replace(/\.[^.]+$/, "");
+    showPhoto();
+    $("status").textContent = `写真: ${f.name}(残り ${photoQueue.length} 枚)。信頼度を調整し「この木を記録」で保存して次へ。`;
+  } catch (e) { $("status").textContent = "写真の処理に失敗: " + e.message; }
+}
+$("photoBtn").onclick = () => $("photo").click();
+$("photo").onchange = e => { photoQueue = [...e.target.files]; e.target.value = ""; nextPhoto(); };
+
 $("csv").onclick = () => {
-  const head = "time,tree_id,mikan_max_in_frame,mikan_tracked_total,marker_max,avg_fps,resolution,duration_s,conf_threshold\n";
+  const head = "time,tree_id,mikan_max_in_frame,mikan_tracked_total,marker_max,avg_fps,resolution,duration_s,conf_threshold,source\n";
   const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-  const body = records.map(r => [r.time, q(r.tree), r.max, r.total, r.marker, r.fps.toFixed(2), r.res, r.sec.toFixed(1), r.conf].join(",")).join("\n");
+  const body = records.map(r => [r.time, q(r.tree), r.max, r.total, r.marker, r.fps.toFixed(2), r.res, r.sec.toFixed(1), r.conf, r.src || "camera"].join(",")).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob(["\ufeff" + head + body], { type: "text/csv" }));
   a.download = "mikan_count.csv"; a.click();
