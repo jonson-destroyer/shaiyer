@@ -67,12 +67,14 @@
   </div>
   <div class="row">
     <label>木のID <input type="text" id="tree" value="T01"></label>
+    <label>条件 <input type="text" id="cond" placeholder="遠 / 近 / 3m" style="width:7em"></label>
     <button id="rec" class="main">この木を記録</button>
-    <button id="csv">CSV保存</button>
+    <button id="csv">CSV(記録まとめ)</button>
+    <button id="dcsv">CSV(1個ずつ)</button>
     <button id="clr">記録を消す</button>
   </div>
   <div class="tw"><table id="tbl"><thead><tr>
-    <th>時刻</th><th>木</th><th>最大</th><th>累計</th><th>marker</th><th>FPS</th><th>解像度</th><th>秒</th>
+    <th>時刻</th><th>木</th><th>条件</th><th>最大</th><th>累計</th><th>marker</th><th>FPS</th><th>解像度</th><th>秒</th>
   </tr></thead><tbody></tbody></table></div>
 </main>
 
@@ -91,6 +93,7 @@ const pre = document.createElement("canvas"); pre.width = pre.height = SIZE;
 const pctx = pre.getContext("2d", { willReadFrequently: true });
 const buf = new Float32Array(3 * SIZE * SIZE);
 
+let lastAll = [], recSeq = 0;
 let photoState = null, photoQueue = [], photoUrl = null, inferBusy = false;
 let threads = 1, session = null, running = false, showTotal = false, stream = null;
 let mikanNow = 0, mikanMax = 0, markerNow = 0, markerMax = 0, totalCount = 0;
@@ -196,7 +199,10 @@ async function loop() {
     const { tensor, scale, px, py } = preprocess();
     inferBusy = true;
     let res; try { res = await session.run({ [session.inputNames[0]]: tensor }); } finally { inferBusy = false; }
-    const dets = decode(res[session.outputNames[0]], scale, px, py, parseFloat($("conf").value));
+    const all = decode(res[session.outputNames[0]], scale, px, py, 0.05);
+    lastAll = all;
+    const th = parseFloat($("conf").value);
+    const dets = all.filter(d => d.s >= th);
     const mk = dets.filter(d => d.c === CLS_MIKAN), mr = dets.filter(d => d.c === CLS_MARKER);
     track(mk);
     mikanNow = mk.length; mikanMax = Math.max(mikanMax, mikanNow);
@@ -254,9 +260,13 @@ $("conf").oninput = e => { $("confv").textContent = e.target.value; if (photoSta
 
 function addRecord(r) {
   r.time = new Date().toISOString(); r.conf = $("conf").value;
+  r.cond = $("cond").value; r.id = ++recSeq;
+  const th = parseFloat(r.conf), mk = (r.all || []).filter(d => d.c === CLS_MIKAN), cnt = mk.filter(d => d.s >= th);
+  r.meanConf = cnt.length ? cnt.reduce((x, d) => x + d.s, 0) / cnt.length : 0;
+  r.n15 = mk.filter(d => d.s >= 0.15).length; r.n25 = mk.filter(d => d.s >= 0.25).length; r.n50 = mk.filter(d => d.s >= 0.5).length;
   records.push(r);
   const tr = document.createElement("tr");
-  [r.time.slice(11, 19), r.tree, r.max, r.total, r.marker, r.fps.toFixed(1), r.res, r.sec.toFixed(r.src === "photo" ? 2 : 0)]
+  [r.time.slice(11, 19), r.tree, r.cond, r.max, r.total, r.marker, r.fps.toFixed(1), r.res, r.sec.toFixed(r.src === "photo" ? 2 : 0)]
     .forEach(v => { const td = document.createElement("td"); td.textContent = v; tr.appendChild(td); });
   $("tbl").tBodies[0].appendChild(tr);
 }
@@ -264,19 +274,23 @@ $("rec").onclick = () => {
   if (photoState) {   // 写真モード: 今の信頼度での検出数を記録して次の写真へ
     const p = photoState;
     addRecord({ tree: $("tree").value, max: p.mk, total: p.mk, marker: p.mr, fps: 1 / p.sec,
-      res: `${p.img.naturalWidth}×${p.img.naturalHeight}`, sec: p.sec, src: "photo" });
+      res: `${p.img.naturalWidth}×${p.img.naturalHeight}`, sec: p.sec, src: "photo",
+      all: p.all, W: p.img.naturalWidth, H: p.img.naturalHeight });
     nextPhoto(); return;
   }
   const sec = (performance.now() - sessStart) / 1000;
   addRecord({ tree: $("tree").value, max: mikanMax, total: totalCount, marker: markerMax,
-    fps: sec > 0 ? sessFrames / sec : 0, res: video.videoWidth ? resText() : "-", sec, src: "camera" });
+    fps: sec > 0 ? sessFrames / sec : 0, res: video.videoWidth ? resText() : "-", sec, src: "camera",
+    all: lastAll, W: video.videoWidth || 0, H: video.videoHeight || 0 });
   resetAll();
 };
 
 // ===== 写真モード =====
 function showPhoto() {
   const p = photoState, w = p.img.naturalWidth, h = p.img.naturalHeight;
-  const dets = decode(p.out, p.scale, p.px, p.py, parseFloat($("conf").value));
+  if (!p.all) p.all = decode(p.out, p.scale, p.px, p.py, 0.05);
+  const th = parseFloat($("conf").value);
+  const dets = p.all.filter(d => d.s >= th);
   const mk = dets.filter(d => d.c === CLS_MIKAN), mr = dets.filter(d => d.c === CLS_MARKER);
   const k = Math.min(1, 1600 / Math.max(w, h));
   cv.width = Math.round(w * k); cv.height = Math.round(h * k);
@@ -318,15 +332,37 @@ async function nextPhoto() {
 $("photoBtn").onclick = () => $("photo").click();
 $("photo").onchange = e => { photoQueue = [...e.target.files]; e.target.value = ""; nextPhoto(); };
 
-$("csv").onclick = () => {
-  const head = "time,tree_id,mikan_max_in_frame,mikan_tracked_total,marker_max,avg_fps,resolution,duration_s,conf_threshold,source\n";
-  const q = s => '"' + String(s).replace(/"/g, '""') + '"';
-  const body = records.map(r => [r.time, q(r.tree), r.max, r.total, r.marker, r.fps.toFixed(2), r.res, r.sec.toFixed(1), r.conf, r.src || "camera"].join(",")).join("\n");
+// CSV-BEGIN
+const q = v => '"' + String(v).replace(/"/g, '""') + '"';
+function summaryCsv(recs) {
+  const head = "record_id,time,tree_id,condition,source,mikan_max_in_frame,mikan_tracked_total,marker_max,mean_conf,n_conf_ge_0.15,n_conf_ge_0.25,n_conf_ge_0.50,avg_fps,resolution,duration_s,conf_threshold\n";
+  return head + recs.map(r => [r.id, r.time, q(r.tree), q(r.cond || ""), r.src || "camera", r.max, r.total, r.marker,
+    r.meanConf.toFixed(4), r.n15, r.n25, r.n50, r.fps.toFixed(2), r.res, r.sec.toFixed(2), r.conf].join(",")).join("\n");
+}
+function detCsv(recs) {
+  const head = "record_id,tree_id,condition,source,image_w,image_h,class,rank,confidence,x1,y1,x2,y2,box_w_px,box_h_px,box_w_rel,box_area_rel,counted\n";
+  const rows = [], names = { [CLS_MARKER]: "marker", [CLS_MIKAN]: "mikan" };
+  for (const r of recs) {
+    const th = parseFloat(r.conf), W = r.W || 1, H = r.H || 1;
+    [...(r.all || [])].sort((a, b) => b.s - a.s).forEach((d, i) => {
+      const x1 = Math.max(0, d.x1), y1 = Math.max(0, d.y1), x2 = Math.min(W, d.x2), y2 = Math.min(H, d.y2);
+      const bw = Math.max(0, x2 - x1), bh = Math.max(0, y2 - y1);
+      rows.push([r.id, q(r.tree), q(r.cond || ""), r.src || "camera", r.W, r.H, names[d.c] || d.c, i + 1, d.s.toFixed(4),
+        x1.toFixed(1), y1.toFixed(1), x2.toFixed(1), y2.toFixed(1), bw.toFixed(1), bh.toFixed(1),
+        (bw / W).toFixed(4), (bw * bh / (W * H)).toFixed(5), d.c === CLS_MIKAN && d.s >= th ? 1 : 0].join(","));
+    });
+  }
+  return head + rows.join("\n");
+}
+// CSV-END
+function download(name, text) {
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob(["\ufeff" + head + body], { type: "text/csv" }));
-  a.download = "mikan_count.csv"; a.click();
-};
-$("clr").onclick = () => { records = []; $("tbl").tBodies[0].innerHTML = ""; };
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + text], { type: "text/csv" }));
+  a.download = name; a.click();
+}
+$("csv").onclick = () => download("mikan_summary.csv", summaryCsv(records));
+$("dcsv").onclick = () => download("mikan_detections.csv", detCsv(records));
+$("clr").onclick = () => { records = []; recSeq = 0; $("tbl").tBodies[0].innerHTML = ""; };
 
 (async function boot() {
   if ("serviceWorker" in navigator) {
