@@ -70,7 +70,8 @@
     <label>条件 <input type="text" id="cond" placeholder="遠 / 近 / 3m" style="width:7em"></label>
     <button id="rec" class="main">この木を記録</button>
     <button id="csv">CSV(記録まとめ)</button>
-    <button id="dcsv">CSV(1個ずつ)</button>
+    <button id="wcsv">CSV(画像ごと・横並び)</button>
+    <button id="dcsv">CSV(1個ずつ・縦)</button>
     <button id="clr">記録を消す</button>
   </div>
   <div class="tw"><table id="tbl"><thead><tr>
@@ -340,19 +341,33 @@ function summaryCsv(recs) {
     r.meanConf.toFixed(4), r.n15, r.n25, r.n50, r.fps.toFixed(2), r.res, r.sec.toFixed(2), r.conf].join(",")).join("\n");
 }
 function detCsv(recs) {
-  const head = "record_id,tree_id,condition,source,image_w,image_h,class,rank,confidence,x1,y1,x2,y2,box_w_px,box_h_px,box_w_rel,box_area_rel,counted\n";
+  const head = "record_id,tree_id,condition,source,image_w,image_h,class,rank,confidence,x1,y1,x2,y2,box_w_px,box_h_px,box_w_rel,box_area_rel,counted,counted_no\n";
   const rows = [], names = { [CLS_MARKER]: "marker", [CLS_MIKAN]: "mikan" };
   for (const r of recs) {
     const th = parseFloat(r.conf), W = r.W || 1, H = r.H || 1;
+    let k = 0;
     [...(r.all || [])].sort((a, b) => b.s - a.s).forEach((d, i) => {
+      const counted = d.c === CLS_MIKAN && d.s >= th, no = counted ? ++k : "";
       const x1 = Math.max(0, d.x1), y1 = Math.max(0, d.y1), x2 = Math.min(W, d.x2), y2 = Math.min(H, d.y2);
       const bw = Math.max(0, x2 - x1), bh = Math.max(0, y2 - y1);
       rows.push([r.id, q(r.tree), q(r.cond || ""), r.src || "camera", r.W, r.H, names[d.c] || d.c, i + 1, d.s.toFixed(4),
         x1.toFixed(1), y1.toFixed(1), x2.toFixed(1), y2.toFixed(1), bw.toFixed(1), bh.toFixed(1),
-        (bw / W).toFixed(4), (bw * bh / (W * H)).toFixed(5), d.c === CLS_MIKAN && d.s >= th ? 1 : 0].join(","));
+        (bw / W).toFixed(4), (bw * bh / (W * H)).toFixed(5), counted ? 1 : 0, no].join(","));
     });
   }
   return head + rows.join("\n");
+}
+function wideCsv(recs) {
+  const rows = recs.map(r => {
+    const th = parseFloat(r.conf);
+    const c = (r.all || []).filter(d => d.c === CLS_MIKAN && d.s >= th).map(d => d.s).sort((a, b) => b - a);
+    return { r, c };
+  });
+  const n = Math.max(0, ...rows.map(x => x.c.length));
+  const cols = Array.from({ length: n }, (_, i) => "conf_" + (i + 1));
+  const head = ["record_id", "tree_id", "condition", "source", "image_w", "image_h", "mikan_count", "mean_conf", "conf_threshold", ...cols].join(",") + "\n";
+  return head + rows.map(({ r, c }) => [r.id, q(r.tree), q(r.cond || ""), r.src || "camera", r.W, r.H, c.length,
+    r.meanConf.toFixed(4), r.conf, ...Array.from({ length: n }, (_, i) => i < c.length ? c[i].toFixed(4) : "")].join(",")).join("\n");
 }
 // CSV-END
 function download(name, text) {
@@ -361,6 +376,7 @@ function download(name, text) {
   a.download = name; a.click();
 }
 $("csv").onclick = () => download("mikan_summary.csv", summaryCsv(records));
+$("wcsv").onclick = () => download("mikan_per_image.csv", wideCsv(records));
 $("dcsv").onclick = () => download("mikan_detections.csv", detCsv(records));
 $("clr").onclick = () => { records = []; recSeq = 0; $("tbl").tBodies[0].innerHTML = ""; };
 
